@@ -56,25 +56,95 @@ class FollowController:
 
     # desired_area — бажана площа рамки ("тримай дистанцію"): ближча ціль → назад,
     #   дальша → вперед. Підбирається під камеру.
-    def __init__(self, desired_area=60000.0):
+    # align_full — до якого |norm_x| дозволено ПОВНИЙ хід уперед (0.15 = ціль
+    #   майже по центру); align_stop — за яким |norm_x| рух уперед ПОВНІСТЮ
+    #   заборонено (0.45 = ціль сильно збоку, спершу доверни).
+    # deadzone — "зона спокою" навколо центру (частка півширини кадру).
+    #   Якщо ціль ближче до центру, ніж deadzone — вважаємо, що вже добре, і
+    #   НЕ рухаємось. Без цього дрон вічно смикався б навколо ідеального центру,
+    #   ганяючись за шумом детектора на кілька пікселів.
+    # retreat_factor — у СКІЛЬКИ разів повільніший рух НАЗАД (ціль наблизилась)
+    #   проти руху вперед. 0.33 = утричі повільніше. Причина: відступати в
+    #   приміщенні небезпечніше — дрон летить від цілі в бік, який "не бачить".
+    def __init__(self, desired_area=60000.0, align_full=0.15, align_stop=0.45,
+                 deadzone=0.05, area_deadzone=0.15, retreat_factor=0.33):
         self._desired_area = desired_area
-        # Коефіцієнти — СТАРТОВІ, їх треба тюнити (див. підказку внизу).
-        self._pid_x = PID(kp=0.20, ki=0.0, kd=0.02)          # горизонталь → yaw
-        self._pid_y = PID(kp=0.20, ki=0.0, kd=0.02)          # вертикаль → висота
-        self._pid_area = PID(kp=0.0015, ki=0.0, kd=0.0001)   # дистанція → вперед/назад
+        self._align_full = align_full
+        self._align_stop = align_stop
+        self._deadzone = deadzone
+        self._area_deadzone = area_deadzone   # ±15% від бажаної площі = "дистанція ок"
+        self._retreat_factor = retreat_factor
+        # Коефіцієнти підняті ~вдвічі проти стартових — дрон реагував мляво.
+        # kd теж піднято: різкіший kp без демпфера дає розхитування.
+        # АГРЕСІЯ ПОВОРОТУ (наскільки різко реагує на зсув цілі від центру).
+        # Історія: 0.38 → 0.57 → 0.855 (було заріздко) → 0.57 (÷1.5, поточне).
+        self._pid_x = PID(kp=0.57, ki=0.0, kd=0.06)          # горизонталь → yaw
+        self._pid_y = PID(kp=0.35, ki=0.0, kd=0.045)         # вертикаль → висота
+        self._pid_area = PID(kp=0.0016, ki=0.0, kd=0.00012)  # дистанція → вперед/назад
 
     def reset(self):
         self._pid_x.reset()
         self._pid_y.reset()
         self._pid_area.reset()
 
-    def update(self, error: ControlError, dt) -> Command:
-        yaw = self._pid_x.update(error.error_x, dt)          # правіше → повертаємось праворуч
+    # trust_distance — чи МОЖНА зараз довіряти площі рамки (тобто дистанції).
+    #   False під час PRED: свіжого виміру немає, площа застаріла. Керувати
+    #   дистанцією за старим числом небезпечно — саме так дрон "летів уперед"
+    #   на людину, вважаючи її далекою. У PRED керуємо лише напрямком.
+    def update(self, error: ControlError, dt, trust_distance=True) -> Command:
+        # Горизонталь центруємо ПОВОРОТОМ (yaw), як людина-оператор.
+        yaw = self._pid_x.update(error.error_x, dt)
         # Вісь y дивиться ВНИЗ, тож інвертуємо знак, щоб + = вгору.
         vertical = -self._pid_y.update(error.error_y, dt)
+
+        if not trust_distance:
+            # Дистанцію не чіпаємо. PID площі теж скидаємо, щоб він не наздоганяв
+            # накопиченим станом, коли ціль повернеться у поле зору.
+            self._pid_area.reset()
+            return Command(yaw=self._gate_yaw(yaw, error),
+                           vertical=self._gate_vertical(vertical, error),
+                           forward=0.0)
+
         # Помилка дистанції = бажана площа - поточна. Далеко → +, тобто вперед.
         forward = self._pid_area.update(self._desired_area - error.area, dt)
-        return Command(yaw=yaw, vertical=vertical, forward=forward)
+
+        # ── ТРИ ЗОНИ ДИСТАНЦІЇ + АСИМЕТРІЯ ─────────────────────────────────
+        #   |area-desired| < area_deadzone → forward=0   SAFE — вис
+        #   area < desired (ціль далеко)   → forward > 0  APPROACH — вперед
+        #   area > desired (ціль близько)  → forward < 0  RETREAT — назад ×0.33
+        if forward < 0:
+            forward *= self._retreat_factor
+
+        # Рух уперед дозволяємо ЛИШЕ тою мірою, якою вже дивимось на ціль:
+        # якщо ціль збоку — спершу довертаємось, тоді їдемо (щоб не летіти повз).
+        forward *= self._alignment(error.norm_x)
+
+        # ЗОНИ СПОКОЮ: біля центру/потрібної відстані не смикаємось за шумом.
+        if self._desired_area and \
+                abs(self._desired_area - error.area) < self._area_deadzone * self._desired_area:
+            forward = 0.0
+
+        return Command(yaw=self._gate_yaw(yaw, error),
+                       vertical=self._gate_vertical(vertical, error),
+                       forward=forward)
+
+    # Зони спокою винесені в методи, щоб застосовувались однаково і в
+    # звичайному режимі, і коли дистанції не довіряємо.
+    def _gate_yaw(self, yaw, error):
+        return 0.0 if abs(error.norm_x) < self._deadzone else yaw
+
+    def _gate_vertical(self, vertical, error):
+        return 0.0 if abs(error.norm_y) < self._deadzone else vertical
+
+    def _alignment(self, norm_x) -> float:
+        """Коефіцієнт 0..1: наскільки ми "дивимось на ціль" і можемо їхати вперед."""
+        offset = abs(norm_x)
+        if offset <= self._align_full:
+            return 1.0
+        if offset >= self._align_stop:
+            return 0.0
+        # Лінійний спад між порогами.
+        return (self._align_stop - offset) / (self._align_stop - self._align_full)
 
 
 # ── Як налаштовувати (tuning) ──────────────────────────────────────────────

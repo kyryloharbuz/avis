@@ -17,8 +17,10 @@ class Renderer(ABC):
         """Підписати функцію на події миші у вікні."""
 
     @abstractmethod
-    def draw(self, frame, detections, target_id, fps, target_lost):
-        """Намалювати кадр з усіма позначками й показати його."""
+    def draw(self, frame, detections, target_id, fps, status, predicted_center=None):
+        """Намалювати кадр з позначками й показати його.
+        status — "VIS" (надійно видно) / "PRED" (ведемо за прогнозом) / "LOST".
+        predicted_center — (x, y) поточної гіпотези Калмана, якщо є."""
 
     @abstractmethod
     def is_open(self) -> bool:
@@ -35,21 +37,49 @@ class CvRenderer(Renderer):
     def set_mouse_callback(self, callback):
         cv2.setMouseCallback(self._window, callback)
 
-    def draw(self, frame, detections, target_id, fps, target_lost):
+    def draw(self, frame, detections, target_id, fps, status, predicted_center=None):
+        # status може бути складеним: "VIS|AUTO" (трекінг|стан польоту).
+        # Для ЛОГІКИ (колір, приціл) беремо лише перший складник, а показуємо
+        # рядок цілком — щоб було видно і трекінг, і режим польоту.
+        base = status.split("|")[0]
         for det in detections:
             x1, y1, x2, y2 = map(int, det.xyxy)
             is_target = det.id == target_id
             color = (0, 0, 255) if is_target else (0, 255, 0)   # ціль — червона (BGR)
             thickness = 3 if is_target else 1
             cv2.rectangle(frame, (x1, y1), (x2, y2), color, thickness)
-            cv2.putText(frame, f"id={det.id}", (x1, max(0, y1 - 8)),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
+            # Підпис: назва класу + track id, напр. "chair #105".
+            # Якщо назви немає (напр. у тестових заглушках) — показуємо лише id.
+            label = f"{det.name} #{det.id}" if det.name else f"id={det.id}"
+            # 0.4 — дрібний шрифт; LINE_AA згладжує, щоб дрібний текст читався.
+            cv2.putText(frame, label, (x1, max(11, y1 - 6)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1, cv2.LINE_AA)
+
+        # ГІПОТЕЗА КАЛМАНА. Раніше при оклюзії на екрані не було НІЧОГО — здавалось,
+        # що трекінг помер, хоча він працював. Тепер малюємо, де система "вважає"
+        # ціль: жовтий приціл у режимі PRED (ведемо наосліп).
+        if predicted_center is not None and base == "PRED":
+            px, py = map(int, predicted_center)
+            cv2.circle(frame, (px, py), 18, (0, 255, 255), 2)          # жовте коло
+            cv2.line(frame, (px - 26, py), (px + 26, py), (0, 255, 255), 1)
+            cv2.line(frame, (px, py - 26), (px, py + 26), (0, 255, 255), 1)
+            cv2.putText(frame, "predicted", (px + 22, py - 22),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
 
         cv2.putText(frame, f"{fps:.1f} FPS", (10, 30),
                     cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
-        if target_lost:
-            cv2.putText(frame, "TARGET LOST", (10, 60),
-                        cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
+
+        # Статус-рядок: одразу видно режим і за яким id ведемо ціль. Це ще й
+        # спосіб помітити хибне перезахоплення (id раптом змінився на чужий).
+        status_color = {"VIS": (0, 255, 0), "PRED": (0, 255, 255)}.get(base, (0, 0, 255))
+        if target_id is None:
+            status_label = status
+        else:
+            # Дістаємо назву цілі з поточних детекцій (якщо вона зараз видима).
+            target_name = next((d.name for d in detections if d.id == target_id), "")
+            status_label = f"{status}  {target_name} #{target_id}".rstrip()
+        cv2.putText(frame, status_label, (10, 60),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, status_color, 2)
 
         cv2.imshow(self._window, frame)
 

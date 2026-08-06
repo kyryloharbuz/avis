@@ -11,15 +11,29 @@ from avis.models import Detection  # значення-об'єкт, який по
 
 
 class Detector:
-    def __init__(self, weights="yolo11n.pt", imgsz=320, tracker="bytetrack.yaml"):
+    # conf — мінімальна впевненість. Дефолт ultralytics 0.25 надто низький: у
+    #   конвеєр летіли слабкі детекції, і саме вони давали плутанину
+    #   "людина ↔ стілець". 0.5 відсікає сміття.
+    # classes — які класи COCO взагалі детектувати. None = усі 80.
+    #   [0] = лише люди — найнадійніший режим для follow-me: стільці, дивани й
+    #   рослини тоді фізично не можуть стати ціллю.
+    def __init__(self, weights="yolo11n.pt", imgsz=320, tracker="bytetrack.yaml",
+                 conf=0.5, classes=None):
         self._model = YOLO(weights)      # важка ініціалізація схована в конструкторі
         self._imgsz = imgsz
         self._tracker = tracker
+        self._conf = conf
+        self._classes = classes
+        # Словник {номер_класу: назва}, напр. {0: "person", 56: "chair"}.
+        # Знання назв живе саме тут (детектор володіє моделлю) — далі по системі
+        # йде вже готова назва, і рендеру не треба нічого знати про YOLO.
+        self._names = self._model.names
 
     def detect(self, frame) -> list[Detection]:
         results = self._model.track(
             frame, imgsz=self._imgsz, persist=True,
             tracker=self._tracker, verbose=False,
+            conf=self._conf, classes=self._classes,
         )
         boxes = results[0].boxes
         if boxes is None or boxes.id is None:   # нікого не знайдено / ще нема id
@@ -28,7 +42,8 @@ class Detector:
         # "Брудні" тензори YOLO перетворюємо на охайні Detection — деталі
         # бібліотеки не витікають назовні (інкапсуляція).
         return [
-            Detection(id = int(track_id), xyxy = tuple(xyxy), conf = conf, cls = int(cls))
+            Detection(id = int(track_id), xyxy = tuple(xyxy), conf = conf, cls = int(cls),
+                      name = self._names.get(int(cls), ""))
             for xyxy, track_id, conf, cls in zip(
                 boxes.xyxy.tolist(), boxes.id.tolist(), boxes.conf.tolist(), boxes.cls.tolist()
             )
