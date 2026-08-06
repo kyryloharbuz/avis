@@ -27,6 +27,22 @@ class Renderer(ABC):
         """Чи вікно ще відкрите."""
 
 
+class HeadlessRenderer(Renderer):
+    """Нічого не малює. Для РЕПЛЕЮ під час тюнінгу: вікно й малювання —
+    найповільніша частина прогону, а при підборі коефіцієнтів дивишся на
+    цифри підсумку, а не на картинку. Без вікна запис проганяється в рази
+    швидше, і можна ганяти багато варіантів поспіль зі скрипта."""
+
+    def set_mouse_callback(self, callback):
+        pass
+
+    def draw(self, frame, detections, target_id, fps, status, predicted_center=None):
+        pass
+
+    def is_open(self) -> bool:
+        return True
+
+
 class CvRenderer(Renderer):
     """Реалізація на OpenCV (вікно на екрані)."""
 

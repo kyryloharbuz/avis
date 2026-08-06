@@ -91,9 +91,16 @@ def test_controller():
     centered = fc.update(err(ex=0, area=30000), 1 / 30)
     check("центр: yaw≈0", abs(centered.yaw) < 1e-6)
     check("центр: forward>0 (їде до далекої цілі)", centered.forward > 0)
-    off = FollowController(desired_area=60000).update(err(ex=250, area=30000), 1 / 30)
-    check("збоку: yaw центрує (>0)", abs(off.yaw) > 0)
-    check("збоку: forward задушено (гейт)", off.forward == 0.0)
+    # ГЕЙТ ВИРІВНЮВАННЯ розширено (align_full 0.35 / align_stop 0.80): дані
+    # показали, що старий вузький гейт душив рух уперед у 100% кадрів, і дрон
+    # ледве наздоганяв ціль. Тепер повне блокування — лише коли ціль майже
+    # на краю кадру.
+    mid = FollowController(desired_area=60000).update(err(ex=250, area=30000), 1 / 30)
+    check("збоку помірно: yaw центрує", abs(mid.yaw) > 0)
+    check("збоку помірно: forward ЧАСТКОВО дозволено", mid.forward > 0)
+
+    edge = FollowController(desired_area=60000).update(err(ex=420, area=30000), 1 / 30)
+    check("ціль на краю: forward повністю задушено", edge.forward == 0.0)
 
     far = FollowController(desired_area=60000).update(err(ex=0, area=20000), 1 / 30).forward
     near = FollowController(desired_area=60000).update(err(ex=0, area=100000), 1 / 30).forward
@@ -331,6 +338,67 @@ def test_bugfixes():
     check("#12 round(), а не int()", sent["yaw"] == 13 and sent["ud"] == -13 and sent["fb"] == 12)
 
 
+def test_arm_and_backward():
+    print("\n[ G під час зльоту + повільний відступ ]")
+    import time as _t
+    from avis.control.drone import Drone, NullDrone
+    from avis.control.flight import FlightSupervisor, AUTO, HOVER, BUSY
+
+    # G, натиснута ПІД ЧАС зльоту, не має пропадати
+    class SlowDrone(Drone):
+        def takeoff(s): _t.sleep(1.0)
+        def land(s): pass
+        def emergency(s): pass
+        def send(s, c): pass
+        def battery(s): return 90
+        def height(s): return 100
+
+    sup = FlightSupervisor(SlowDrone())
+    with quiet():
+        sup.takeoff()
+        sup.toggle()                       # G ще під час зльоту
+    check("G під час зльоту: стан ще BUSY", sup.state == BUSY)
+    _t.sleep(1.4)
+    check("після зльоту стеження увімкнулось САМО", sup.state == AUTO)
+
+    # повторна G має вимикати (а не вмикати знову)
+    with quiet():
+        sup.toggle()
+    check("повторна G вимикає стеження", sup.state == HOVER)
+
+    # відступ удвічі повільніший за наступ
+    s2 = FlightSupervisor(NullDrone(), enable_forward=True)
+    fwd = s2._limit(Command(0, 0, 999)).forward
+    bwd = s2._limit(Command(0, 0, -999)).forward
+    check("вперед стеля 30", fwd == 30)
+    check("назад стеля 15 (удвічі повільніше)", bwd == -15)
+
+
+def test_key_debounce():
+    print("\n[ Дебаунс клавіш (одне натискання = одна дія) ]")
+    from avis.app import App
+    from avis.control.drone import NullDrone
+    from avis.control.flight import FlightSupervisor, AUTO, HOVER
+    from avis.perception import KalmanFilter, TargetSelector
+    from avis.control import ErrorCalculator
+    from avis.control.controller import FollowController
+    from avis.view import HeadlessRenderer
+
+    sup = FlightSupervisor(NullDrone())
+    app = App(source=None, detector=None, selector=TargetSelector(),
+              tracker=KalmanFilter(), error_calculator=ErrorCalculator(),
+              controller=FollowController(), renderer=HeadlessRenderer(),
+              supervisor=sup)
+    with quiet():
+        sup.takeoff()
+        while sup.state == "BUSY":
+            pass
+        # ДВІ однакові події поспіль (дубль від вікна + терміналу)
+        app._handle_key(ord('g'))
+        app._handle_key(ord('g'))
+    check("дубль G не скасовує сам себе — лишається AUTO", sup.state == AUTO)
+
+
 def test_nonblocking_takeoff():
     print("\n[ Зліт не блокує цикл (відео не зависає) ]")
     import time as _t
@@ -514,6 +582,7 @@ def main():
     for t in (test_models, test_error_calculator, test_controller, test_kalman,
               test_selector, test_supervisor, test_drone, test_key_handling,
               test_bugfixes, test_nonblocking_takeoff,
+              test_arm_and_backward, test_key_debounce,
               test_integration_live, test_integration_replay):
         try:
             t()

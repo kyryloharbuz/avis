@@ -28,7 +28,7 @@ class TargetSelector:
         reference_smoothing=0.1,      # EMA еталонної ПЛОЩІ
         reacquire_radius=120.0,       # базовий радіус (px) перезахоплення
         reacquire_growth=80.0,        # +px до радіуса за секунду відсутності
-        reacquire_radius_max=220.0,   # стеля радіуса (було 400 — пів кадру,
+        reacquire_radius_max=220.0,   # МАКСИМУМ радіуса (було 400 — пів кадру,
                                       #   через це дрон хапав сторонні об'єкти)
     ):
         self._lost_grace_seconds = lost_grace_seconds

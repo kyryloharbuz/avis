@@ -66,26 +66,68 @@ class FollowController:
     # retreat_factor — у СКІЛЬКИ разів повільніший рух НАЗАД (ціль наблизилась)
     #   проти руху вперед. 0.33 = утричі повільніше. Причина: відступати в
     #   приміщенні небезпечніше — дрон летить від цілі в бік, який "не бачить".
-    def __init__(self, desired_area=60000.0, align_full=0.15, align_stop=0.45,
-                 deadzone=0.05, area_deadzone=0.15, retreat_factor=0.33):
+    # Коефіцієнти PID — ПАРАМЕТРИ, а не константи всередині. Це потрібно саме
+    # для тюнінгу на реплеї: можна прогнати той самий запис із десятком різних
+    # kp у циклі й порівняти числа, не редагуючи файл щоразу.
+    def __init__(self, desired_area=94000.0, align_full=0.35, align_stop=0.80,
+                 deadzone=0.05, area_deadzone=0.15, retreat_factor=0.33,
+                 kp_yaw=0.40, kd_yaw=0.10,
+                 kp_vertical=0.35, kd_vertical=0.045,
+                 kp_area=0.0016, kd_area=0.00012,
+                 vertical_adapt_tau=8.0, vertical_deadzone_px=45.0):
         self._desired_area = desired_area
         self._align_full = align_full
         self._align_stop = align_stop
         self._deadzone = deadzone
         self._area_deadzone = area_deadzone   # ±15% від бажаної площі = "дистанція ок"
         self._retreat_factor = retreat_factor
-        # Коефіцієнти підняті ~вдвічі проти стартових — дрон реагував мляво.
-        # kd теж піднято: різкіший kp без демпфера дає розхитування.
-        # АГРЕСІЯ ПОВОРОТУ (наскільки різко реагує на зсув цілі від центру).
-        # Історія: 0.38 → 0.57 → 0.855 (було заріздко) → 0.57 (÷1.5, поточне).
-        self._pid_x = PID(kp=0.57, ki=0.0, kd=0.06)          # горизонталь → yaw
-        self._pid_y = PID(kp=0.35, ki=0.0, kd=0.045)         # вертикаль → висота
-        self._pid_area = PID(kp=0.0016, ki=0.0, kd=0.00012)  # дистанція → вперед/назад
+
+        # ── АДАПТИВНА ВЕРТИКАЛЬ ────────────────────────────────────────────
+        # Проблема, яку це лікує (виміряна на 10 польотах): центр рамки людини
+        # СИСТЕМАТИЧНО стоїть вище центру кадру (y≈230 проти 360, тобто ≈-130px)
+        # на будь-якій дистанції. Через це дрон отримував команду "вгору"
+        # БЕЗПЕРЕРВНО й повільно ліз до стелі.
+        #
+        # Рішення: цілимось не в центр кадру, а у ВЛАСНИЙ ЗВИЧНИЙ РІВЕНЬ ЦІЛІ.
+        # Повільна ковзна середня (tau ≈ 8 с) вбирає постійний зсув, тож він
+        # більше не дає команди. А ШВИДКА зміна — присів або встав — за 8 секунд
+        # всмоктатись не встигає, дає велике відхилення й дрон іде вниз/вгору.
+        # Тобто: постійний нахил ігноруємо, реальний рух цілі відпрацьовуємо.
+        self._vertical_adapt_tau = vertical_adapt_tau
+        self._vertical_deadzone_px = vertical_deadzone_px
+        self._vertical_ref = None      # звичний рівень цілі (у пікселях помилки)
+        self._vertical_dev = 0.0       # поточне відхилення від цього рівня
+        # kp_yaw — АГРЕСІЯ ПОВОРОТУ. Знижено 0.57 → 0.40, а демпфер kd
+        #   піднято 0.06 → 0.10. Причина з даних польоту: поворот був у
+        #   САТУРАЦІЇ 49% часу — тобто крутив на максимумі майже безперервно,
+        #   і це відчувалось як кидання з боку в бік. Менший kp + більший
+        #   демпфер дають плавніше ведення ціною трохи повільнішого доводу.
+        self._pid_x = PID(kp=kp_yaw, ki=0.0, kd=kd_yaw)            # горизонталь → yaw
+        self._pid_y = PID(kp=kp_vertical, ki=0.0, kd=kd_vertical)  # вертикаль → висота
+        self._pid_area = PID(kp=kp_area, ki=0.0, kd=kd_area)       # дистанція → вперед/назад
 
     def reset(self):
         self._pid_x.reset()
         self._pid_y.reset()
         self._pid_area.reset()
+        # Звичний рівень — властивість КОНКРЕТНОЇ цілі, тож при зміні цілі
+        # (або втраті) його треба вчити наново.
+        self._vertical_ref = None
+        self._vertical_dev = 0.0
+
+    def _vertical_deviation(self, error, dt):
+        """Наскільки ціль зараз вище/нижче за СВІЙ звичний рівень, у пікселях.
+        0 означає "ціль там, де зазвичай" — тобто постійний зсув ігнорується."""
+        if self._vertical_ref is None:
+            self._vertical_ref = error.error_y      # перше бачення = еталон
+            self._vertical_dev = 0.0
+            return 0.0
+        self._vertical_dev = error.error_y - self._vertical_ref
+        # Повільно підтягуємо еталон до поточного рівня. Що більше tau, то
+        # довше "пам'ятає" і то впевненіше реагує на присідання.
+        a = min(1.0, dt / self._vertical_adapt_tau)
+        self._vertical_ref = (1 - a) * self._vertical_ref + a * error.error_y
+        return self._vertical_dev
 
     # trust_distance — чи МОЖНА зараз довіряти площі рамки (тобто дистанції).
     #   False під час PRED: свіжого виміру немає, площа застаріла. Керувати
@@ -94,8 +136,10 @@ class FollowController:
     def update(self, error: ControlError, dt, trust_distance=True) -> Command:
         # Горизонталь центруємо ПОВОРОТОМ (yaw), як людина-оператор.
         yaw = self._pid_x.update(error.error_x, dt)
+        # ВЕРТИКАЛЬ: керуємо не за помилкою від центру кадру, а за ВІДХИЛЕННЯМ
+        # цілі від її ж звичного рівня (див. коментар у конструкторі).
         # Вісь y дивиться ВНИЗ, тож інвертуємо знак, щоб + = вгору.
-        vertical = -self._pid_y.update(error.error_y, dt)
+        vertical = -self._pid_y.update(self._vertical_deviation(error, dt), dt)
 
         if not trust_distance:
             # Дистанцію не чіпаємо. PID площі теж скидаємо, щоб він не наздоганяв
@@ -131,10 +175,27 @@ class FollowController:
     # Зони спокою винесені в методи, щоб застосовувались однаково і в
     # звичайному режимі, і коли дистанції не довіряємо.
     def _gate_yaw(self, yaw, error):
-        return 0.0 if abs(error.norm_x) < self._deadzone else yaw
+        """М'ЯКА зона спокою замість жорсткої.
+
+        Було: усередині зони — рівно 0, а на крок за неї — одразу повна
+        команда. Це "сходинка": відходиш убік, і дрон різко смикається в
+        поворот, хоч зсув ще малий.
+
+        Стало: біля межі зони команда починається з НУЛЯ і росте плавно —
+        ривка немає, а спокій біля центру зберігається."""
+        offset = abs(error.norm_x)
+        if offset < self._deadzone:
+            return 0.0
+        # 0 на самій межі зони → 1 при великому зсуві.
+        ramp = (offset - self._deadzone) / max(1.0 - self._deadzone, 1e-6)
+        return yaw * min(ramp / max(offset, 1e-6), 1.0)
 
     def _gate_vertical(self, vertical, error):
-        return 0.0 if abs(error.norm_y) < self._deadzone else vertical
+        """Зона спокою вертикалі — по ВІДХИЛЕННЮ від звичного рівня цілі,
+        у ПІКСЕЛЯХ. Поріг великий (~45px) навмисно: дрібне тремтіння рамки не
+        має рухати дрон, а присідання людини зсуває центр на 100-150px —
+        тобто впевнено перевищує поріг і спрацьовує."""
+        return 0.0 if abs(self._vertical_dev) < self._vertical_deadzone_px else vertical
 
     def _alignment(self, norm_x) -> float:
         """Коефіцієнт 0..1: наскільки ми "дивимось на ціль" і можемо їхати вперед."""

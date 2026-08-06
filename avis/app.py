@@ -13,6 +13,8 @@ import cv2  # App потрібен лише для констант/обробк
 # Імпортуємо через "фасади" підпакетів (їхні __init__.py), а не з глибоких шляхів.
 from avis.control import ErrorCalculator, FollowController
 from avis.control.flight import AUTO, GROUNDED, FlightSupervisor
+from avis.distance import DistanceEstimator
+from avis.metrics import FollowScore
 from avis.perception import Detector, FrameSource, KalmanFilter, TargetSelector
 from avis.view import Renderer
 from avis.view.keys import TerminalKeys
@@ -58,15 +60,23 @@ class App:
         self._pending_click = None   # відкладений клік (x, y) для надійного вибору
         self._pending_click_ttl = 0  # скільки кадрів ще пробувати обрати ціль
         self._active_target_id = None  # id цілі минулого кадру (ловимо підміну)
+        self._last_key = None          # дебаунс клавіш
+        self._last_key_time = 0.0
         # Підсумкова статистика прогону (для чесного порівняння тюнінгів).
         self._stats = {
             "frames": 0, "VIS": 0, "PRED": 0, "LOST": 0,
             "sum_ex": 0.0, "sum_ey": 0.0,
-            "sat_fwd": 0, "sat_yaw": 0, "sat_vert": 0,  # кадрів у сатурації (впертись у стелю)
+            "sat_fwd": 0, "sat_yaw": 0, "sat_vert": 0,  # кадрів у сатурації (впертись у межу)
             "cmd_frames": 0,                             # кадрів, де взагалі були команди
             "jitter": 0.0, "jitter_n": 0,                # дрож: сума |Δcmd| між кадрами
         }
         self._prev_sent = None    # попередня відправлена команда (для дрожу)
+        # Метрика ЯКОСТІ стеження у стилі Andon Labs Drone-Bench.
+        self._distance = DistanceEstimator()
+        self._follow = FollowScore(
+            desired_area=getattr(controller, '_desired_area', 60000.0),
+            estimator=self._distance)
+        self._last_box_height = 0.0   # висота рамки цілі (для оцінки дистанції)
 
     def _on_mouse(self, event, x, y, flags, param):
         if event == cv2.EVENT_LBUTTONDOWN:
@@ -179,6 +189,7 @@ class App:
                     # `*target.center` розкладає кортеж (cx, cy) на два аргументи.
                     center = self._tracker.correct(*target.center)
                     self._last_area = target.area
+                    self._last_box_height = target.xyxy[3] - target.xyxy[1]
                     status = "VIS"
                 elif lost:
                     # Оклюзія (<25%) або коротке зникнення: рамці не віримо —
@@ -233,6 +244,11 @@ class App:
 
                 # --- Крок 3c: статистика + ЗАПИС (для аналізу й реплею) ---
                 self._accumulate_stats(status, center, w, h, cmd, sent)
+                # Follow-скор рахуємо ЛИШЕ по реально видимій цілі (VIS):
+                # у PRED позиція — гіпотеза Калмана, зараховувати її як
+                # успіх стеження було б самообманом.
+                self._follow.add(center if status == 'VIS' else None,
+                                 self._last_area, w, h, self._last_box_height)
                 if self._recorder is not None:
                     # ЧИСТИЙ кадр (до малювання рамок) + вхід пайплайну + базова
                     # лінія (що реально пішло в мотори, стан, заряд).
@@ -281,7 +297,7 @@ class App:
 
     def _accumulate_stats(self, status, center, w, h, cmd=None, sent=None):
         """Копить підсумок прогону — метрики для ЧЕСНОГО порівняння тюнінгів:
-        стани, помилка по осях, САТУРАЦІЯ (чи впирається в стелю) і ДРОЖ команд."""
+        стани, помилка по осях, САТУРАЦІЯ (чи впирається в межу) і ДРОЖ команд."""
         s = self._stats
         s["frames"] += 1
         s[status] = s.get(status, 0) + 1
@@ -292,7 +308,7 @@ class App:
         if cmd is not None and sent is not None:
             s["cmd_frames"] += 1
             # САТУРАЦІЯ: supervisor обрізав команду (|відправлено| < |просив|).
-            # Не треба знати стелі — сам факт обрізання і є сатурація.
+            # Не треба знати меж — сам факт обрізання і є сатурація.
             eps = 0.5
             if abs(sent.forward) + eps < abs(cmd.forward):
                 s["sat_fwd"] += 1
@@ -330,8 +346,10 @@ class App:
                   f"вертикаль {100 * s['sat_vert'] / cf:.0f}%")
             if s["jitter_n"]:
                 print(f"  дрож команд    : {s['jitter'] / s['jitter_n']:.1f} од/кадр")
+        for line in self._follow.report():
+            print("  " + line)
         print("  ── менша помилка + менша дрож = кращий тюнінг")
-        print("  ── висока сатурація вперед = стеля max_forward тримає, підіймай її")
+        print("  ── висока сатурація вперед = обмеження max_forward тримає, підіймай його")
         print("─" * 60)
 
     def _handle_key(self, key):
@@ -343,6 +361,16 @@ class App:
         клавіші не спрацьовували, щойно фокус переходив на вікно OpenCV (тобто
         одразу після кліку по цілі) — і дрон не вмикав стеження."""
         codes = {key, key & 0xFF}
+
+        # ДЕБАУНС: одне фізичне натискання може прийти двічі (і з вікна OpenCV,
+        # і з терміналу, або повторитись на наступному кадрі). Для G це було
+        # особливо підступно: два спрацювання = увімкнув і одразу вимкнув
+        # стеження, тому й здавалось, що "треба тиснути кілька разів".
+        now = time.time()
+        norm = key & 0xFF
+        if norm == self._last_key and (now - self._last_key_time) < 0.4:
+            return False
+        self._last_key, self._last_key_time = norm, now
 
         if codes & _QUIT_KEYS:
             return True

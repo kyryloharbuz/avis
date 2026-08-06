@@ -9,7 +9,7 @@ from datetime import datetime
 from avis.app import App
 from avis.control import ErrorCalculator, FollowController
 from avis.perception import Detector, KalmanFilter, TargetSelector, WebcamSource
-from avis.view import CvRenderer
+from avis.view import CvRenderer, HeadlessRenderer
 
 
 def _build_tello(fly: bool, forward: bool):
@@ -52,7 +52,8 @@ _NO_RECORD = object()
 
 
 def build_app(use_tello=False, fly=False, forward=False,
-              record_name=None, replay_name=None, person_only=False) -> App:
+              record_name=None, replay_name=None, person_only=False,
+              headless=False) -> App:
     """Зібрати додаток. Джерело кадрів обирається тут — у цьому вся суть
     інтерфейсу FrameSource (вебкамера / Tello / реплей взаємозамінні)."""
     # person_only=True → детектуємо ЛИШЕ людей (клас COCO 0). Найнадійніший
@@ -85,7 +86,8 @@ def build_app(use_tello=False, fly=False, forward=False,
         tracker=KalmanFilter(),
         error_calculator=ErrorCalculator(),
         controller=FollowController(),
-        renderer=CvRenderer(),
+        # headless — без вікна: реплей женеться максимально швидко.
+        renderer=HeadlessRenderer() if headless else CvRenderer(),
         recorder=recorder,
     )
 
@@ -120,4 +122,5 @@ if __name__ == "__main__":
         record_name=rec,
         replay_name=_arg_value(sys.argv, "--replay"),
         person_only="--person" in sys.argv,   # детектувати ЛИШЕ людей
+        headless="--headless" in sys.argv,    # реплей без вікна (швидкий тюнінг)
     ).run()

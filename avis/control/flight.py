@@ -30,9 +30,19 @@ class FlightSupervisor:
     def __init__(
         self,
         drone,
-        max_speed=70,              # СТЕЛЯ швидкості поворот/висота
-        max_forward=30,            # окрема, нижча стеля для руху ВПЕРЕД (ризикова вісь)
+        max_speed=70,              # МЕЖА швидкості повороту й вертикалі
+        max_forward=30,            # МЕЖА швидкості руху ВПЕРЕД (ризикова вісь)
+        max_backward=15,           # МЕЖА швидкості руху НАЗАД — удвічі нижча за вперед.
+                                   #   Коли людина йде на дрон, площа рамки росте
+                                   #   різко, і регулятор просив повний хід назад:
+                                   #   дрон сахався надто швидко. Відступ має бути
+                                   #   спокійним — позаду він нічого не бачить.
         min_speed=12,              # нижче цього Tello просто ігнорує команду
+        slew_per_second=90.0,      # ПЛАВНІСТЬ: на скільки одиниць за секунду
+                                   #   команді дозволено НАРОСТАТИ. Гальмування
+                                   #   (до нуля) НЕ обмежене — зупинка миттєва.
+                                   #   Лікує різкий ривок повороту: замість
+                                   #   стрибка 0→30 команда доходить за ~0.3 с.
         hover_after_lost=0.5,      # с без цілі → перестати рухатись, висіти
         land_after_lost=8.0,       # с без цілі → сідати самому (лише ПІСЛЯ 1-го захоплення)
         settle_after_takeoff=5.0,  # с ЗАВИСУ після зльоту: Tello стабілізується
@@ -50,7 +60,10 @@ class FlightSupervisor:
         self._drone = drone
         self._max_speed = max_speed
         self._max_forward = max_forward
+        self._max_backward = max_backward
         self._min_speed = min_speed
+        self._slew = slew_per_second
+        self._prev_cmd = Command(0.0, 0.0, 0.0)
         self._min_height = min_height_cm
         self._max_height = max_height_cm
         self._height_margin = height_margin_cm
@@ -71,6 +84,7 @@ class FlightSupervisor:
         self._ever_acquired = False   # чи хоч раз захопили ціль у цьому польоті
         self._last_battery = None     # кеш заряду (щоб писати в лог без зайвих запитів)
         self._busy = False            # виконується зліт/посадка у фоновому потоці
+        self._arm_requested = False   # G натиснули ще під час зльоту
 
     @property
     def state(self):
@@ -126,6 +140,9 @@ class FlightSupervisor:
             self._settle = self._settle_after_takeoff
             self._ever_acquired = False
             print("[flight] у повітрі. HOVER. Натисни G, щоб увімкнути стеження.")
+            if self._arm_requested:          # G тиснули ще під час зльоту
+                self._arm_requested = False
+                self.arm()
 
         self._run_async("зліт", self._drone.takeoff, done)
 
@@ -135,6 +152,7 @@ class FlightSupervisor:
         print("[flight] саджу")
         self._settle = 0.0
         self._ever_acquired = False
+        self._arm_requested = False
         self._state = GROUNDED       # одразу, щоб цикл більше не слав команд
         self._run_async("посадка", self._drone.land, lambda: None)
 
@@ -150,11 +168,20 @@ class FlightSupervisor:
             print(f"[flight] аварійна команда не пройшла: {e}")
 
     def arm(self):
-        """Увімкнути автономне стеження (лише з режиму висіння)."""
+        """Увімкнути автономне стеження.
+
+        ЧОМУ ТУТ ВІДКЛАДЕНИЙ ЗАПИТ: зліт виконується у фоні й може відповідати
+        кілька секунд. Якщо натиснути G у цей момент, стан ще GROUNDED — і
+        раніше натискання просто ПРОПАДАЛО, доводилось тиснути ще раз. Тепер
+        запам'ятовуємо намір і вмикаємо стеження, щойно дрон опиниться в HOVER."""
         if self._state == HOVER:
             self._state = AUTO
             self._time_without_target = 0.0
+            self._arm_requested = False
             print("[flight] AUTO — стеження увімкнено")
+        elif self._busy or self._state == GROUNDED:
+            self._arm_requested = True
+            print("[flight] зліт ще триває — стеження увімкнеться автоматично")
 
     def disarm(self):
         """Вимкнути стеження, лишитись у повітрі."""
@@ -164,7 +191,13 @@ class FlightSupervisor:
             print("[flight] HOVER — стеження вимкнено")
 
     def toggle(self):
-        self.arm() if self._state == HOVER else self.disarm()
+        # Під час зльоту (BUSY) або на землі — трактуємо G як ЗАПИТ увімкнути,
+        # а не як вимкнення. Інакше натискання під час зльоту йшло б у
+        # disarm() і мовчки пропадало.
+        if self._state == AUTO:
+            self.disarm()
+        else:
+            self.arm()
 
     # ── Основний крок, викликається щокадру ────────────────────────────
     def update(self, command, has_target, dt):
@@ -188,6 +221,7 @@ class FlightSupervisor:
 
         # У режимі висіння PID ігноруємо повністю.
         if self._state == HOVER:
+            self._prev_cmd = Command(0.0, 0.0, 0.0)
             self._drone.send(Command(0, 0, 0))
             return Command(0, 0, 0)
 
@@ -199,13 +233,14 @@ class FlightSupervisor:
         # "пливе" вбік. Даємо йому спокій, тоді починаємо стеження.
         if self._settle > 0.0:
             self._settle -= dt
+            self._prev_cmd = Command(0.0, 0.0, 0.0)
             self._drone.send(Command(0, 0, 0))
             return Command(0, 0, 0)
 
         if has_target and command is not None:
             self._time_without_target = 0.0
             self._ever_acquired = True         # ціль хоч раз захоплена
-            safe = self._limit(command)
+            safe = self._ramp(self._limit(command), dt)
             self._drone.send(safe)
             return safe
 
@@ -224,16 +259,38 @@ class FlightSupervisor:
         if self._time_without_target >= self._hover_after_lost:
             # ВИСИМО. Ключове рішення безпеки: не продовжуємо рух останньою
             # командою — дрон, що летить наосліп, врізається в стіну.
+            self._prev_cmd = Command(0.0, 0.0, 0.0)
             self._drone.send(Command(0, 0, 0))
             return Command(0, 0, 0)
 
         # Дуже коротка пауза (< 0.5 с) — дотримуємось прогнозу Калмана.
         if command is not None:
-            safe = self._limit(command)
+            safe = self._ramp(self._limit(command), dt)
             self._drone.send(safe)
             return safe
         self._drone.send(Command(0, 0, 0))
         return Command(0, 0, 0)
+
+    def _ramp(self, target: Command, dt) -> Command:
+        """Обмежити ШВИДКІСТЬ НАРОСТАННЯ команди (не саму команду).
+
+        Асиметрично й навмисно:
+          • РОЗГІН обмежений — звідси плавність, немає ривків;
+          • ГАЛЬМУВАННЯ (у бік нуля) миттєве — якщо треба зупинитись або
+            змінити напрямок, дрон робить це без затримки. Плавність не має
+            коштувати безпеки."""
+        step = self._slew * max(dt, 1e-3)
+
+        def one(new, old):
+            if abs(new) <= abs(old) or new * old < 0:
+                return new                      # гальмуємо / міняємо напрямок — миттєво
+            return max(old - step, min(new, old + step))
+
+        out = Command(yaw=one(target.yaw, self._prev_cmd.yaw),
+                      vertical=one(target.vertical, self._prev_cmd.vertical),
+                      forward=one(target.forward, self._prev_cmd.forward))
+        self._prev_cmd = out
+        return out
 
     # Приведення команд PID до безпечного, але ДІЄВОГО діапазону.
     def _limit(self, c: Command) -> Command:
@@ -243,8 +300,11 @@ class FlightSupervisor:
             yaw=self._shape(c.yaw, self._max_speed),
             vertical=vertical,
             # Рух уперед/назад — найризикованіший (дрон летить НА тебе). Тому
-            # окрема, нижча стеля і вимкнення за замовчуванням.
-            forward=self._shape(c.forward, self._max_forward) if self._enable_forward else 0.0,
+            # окрема, нижча межа і вимкнення за замовчуванням.
+            # Стеля залежить від НАПРЯМКУ: назад — удвічі повільніше.
+            forward=(self._shape(c.forward,
+                                 self._max_forward if c.forward >= 0 else self._max_backward)
+                     if self._enable_forward else 0.0),
         )
 
     def _apply_altitude(self, vertical):
@@ -276,7 +336,7 @@ class FlightSupervisor:
         PID — подвійне послаблення. Через нього помилка 60px давала в мотори 9,
         а Tello ігнорує все, що менше ~10-15. Звідси й була млявість.
 
-        Тепер: стеля — це просто обрізання, а не множник. Плюс компенсація
+        Тепер: межа — це просто обрізання, а не множник. Плюс компенсація
         "мертвої зони": ненульову, але заслабку команду підтягуємо до min_speed,
         інакше дрон її просто не відпрацює."""
         if v == 0:
