@@ -79,35 +79,17 @@ def test_error_calculator():
 
 
 def test_controller():
-    print("\n[ FollowController (pure yaw, без строуфа) ]")
-    from avis.control.controller import PID, FollowController
+    print("\n[ PID (сам регулятор) ]")
+    from avis.control.controller import PID
     p = PID(kp=0.2, ki=0, kd=0)
     o1 = p.update(100, 0.1)
     check("PID: стала помилка → стабільний вихід", approx(p.update(100, 0.1), o1))
     p.reset()
     check("PID.reset() очищає стан", p._prev_error is None and p._integral == 0)
+    check("PID обмежує вихід", abs(PID(kp=100, ki=0, kd=0).update(999, 0.1)) <= 100)
+    # Поведінка стеження тепер перевіряється в tests/test_follow.py —
+    # там кожна вісь має власні тести.
 
-    fc = FollowController(desired_area=60000)
-    centered = fc.update(err(ex=0, area=30000), 1 / 30)
-    check("центр: yaw≈0", abs(centered.yaw) < 1e-6)
-    check("центр: forward>0 (їде до далекої цілі)", centered.forward > 0)
-    # ГЕЙТ ВИРІВНЮВАННЯ розширено (align_full 0.35 / align_stop 0.80): дані
-    # показали, що старий вузький гейт душив рух уперед у 100% кадрів, і дрон
-    # ледве наздоганяв ціль. Тепер повне блокування — лише коли ціль майже
-    # на краю кадру.
-    mid = FollowController(desired_area=60000).update(err(ex=250, area=30000), 1 / 30)
-    check("збоку помірно: yaw центрує", abs(mid.yaw) > 0)
-    check("збоку помірно: forward ЧАСТКОВО дозволено", mid.forward > 0)
-
-    edge = FollowController(desired_area=60000).update(err(ex=420, area=30000), 1 / 30)
-    check("ціль на краю: forward повністю задушено", edge.forward == 0.0)
-
-    far = FollowController(desired_area=60000).update(err(ex=0, area=20000), 1 / 30).forward
-    near = FollowController(desired_area=60000).update(err(ex=0, area=100000), 1 / 30).forward
-    check("асиметрія: назад ≈ 0.33×вперед", far > 0 and near < 0 and approx(abs(near) / far, 0.33, 0.05))
-
-    dz = FollowController().update(err(ex=10, area=60000), 1 / 30)  # norm_x≈0.02 < deadzone
-    check("deadzone: біля центру yaw=0", dz.yaw == 0.0)
 
 
 def test_kalman():
@@ -241,11 +223,11 @@ def test_supervisor():
 
     # ТРИ окремі стелі: горизонталь і поворот прискорені, ВЕРТИКАЛЬ недоторкана
     s9 = FlightSupervisor(NullDrone(), enable_forward=True)
-    check("max_forward = 30 (відкат)", s9._max_forward == 30)
+    check("max_forward = 55", s9._max_forward == 55)
     check("max_speed = 70 (єдина стеля yaw+вертикаль)", s9._max_speed == 70)
     
     lim = s9._limit(Command(yaw=999, vertical=999, forward=999))
-    check("_limit: forward ріжеться до 30", lim.forward == 30)
+    check("_limit: forward ріжеться до 55", lim.forward == 55)
     check("_limit: yaw ріжеться до 70", lim.yaw == 70)
     check("_limit: vertical ріжеться до 70", lim.vertical == 70)
 
@@ -276,7 +258,7 @@ def test_drone():
 def test_bugfixes():
     print("\n[ Виправлені баги (регресійні запобіжники) ]")
     from avis.perception.target_selector import TargetSelector
-    from avis.control.controller import FollowController
+    from avis.control.follow import FollowController
     from avis.control.flight import FlightSupervisor, GROUNDED, HOVER, AUTO, BUSY
     from avis.control.drone import Drone, NullDrone
 
@@ -311,13 +293,7 @@ def test_bugfixes():
     s.resolve([chair_same_id])                             # YOLO раптом каже "стілець"
     check("#2 клас цілі лишився людиною", s._target_cls == 0)
 
-    # БАГ #3: без довіри до дистанції рух уперед = 0
-    fc = FollowController(desired_area=60000)
-    c_far = fc.update(err(ex=0, area=10000), 1 / 30, trust_distance=True)
-    c_pred = FollowController(desired_area=60000).update(
-        err(ex=0, area=10000), 1 / 30, trust_distance=False)
-    check("#3 VIS: їде вперед", c_far.forward > 0)
-    check("#3 PRED: forward=0 (не летить на застарілій площі)", c_pred.forward == 0.0)
+    # БАГ #3 тепер покрито в tests/test_follow.py (test_controller: PRED)
 
     # БАГ #6: клік між двох рамок бере ту, чий ЦЕНТР ближчий
     s2 = TargetSelector()
@@ -370,8 +346,8 @@ def test_arm_and_backward():
     s2 = FlightSupervisor(NullDrone(), enable_forward=True)
     fwd = s2._limit(Command(0, 0, 999)).forward
     bwd = s2._limit(Command(0, 0, -999)).forward
-    check("вперед стеля 30", fwd == 30)
-    check("назад стеля 15 (удвічі повільніше)", bwd == -15)
+    check("вперед межа 55", fwd == 55)
+    check("назад межа 25 (нижча за вперед, але ДІЄВА)", bwd == -25)
 
 
 def test_key_debounce():
@@ -381,7 +357,7 @@ def test_key_debounce():
     from avis.control.flight import FlightSupervisor, AUTO, HOVER
     from avis.perception import KalmanFilter, TargetSelector
     from avis.control import ErrorCalculator
-    from avis.control.controller import FollowController
+    from avis.control.follow import FollowController
     from avis.view import HeadlessRenderer
 
     sup = FlightSupervisor(NullDrone())
@@ -509,7 +485,7 @@ def test_integration_live():
               tracker=KalmanFilter(), error_calculator=ErrorCalculator(),
               controller=FollowController(), renderer=Head(),
               supervisor=FlightSupervisor(NullDrone(), start_armed=True, enable_forward=True))
-    app._selector.select_target(Detection(id=1, xyxy=(450, 220, 510, 340), conf=.9, cls=0))
+    app._pipeline.select_target(Detection(id=1, xyxy=(450, 220, 510, 340), conf=.9, cls=0))
     with quiet():
         app.run()
     check("App.run() без крашів", True)
@@ -575,6 +551,101 @@ def test_integration_replay():
     check("тимчасові файли реплею прибрано", True)
 
 
+def test_frame_quality():
+    """Побитий кадр = 'нічого не бачу', а НЕ 'цілі немає'.
+
+    Заміряно на реальних польотах: детекція на чистих кадрах 85%, на побитих
+    6%, і 42% кадрів у довгих втратах цілі — побиті. Тому відсутність рамки на
+    такому кадрі нічого не доводить, і відлік втрати має стояти."""
+    print("\n[ Якість кадру / втрата пакетів ]")
+    from avis.perception.frame_quality import FrameQuality
+
+    rng = np.random.default_rng(7)
+
+    def clean(h=240, w=320):
+        """Природне зображення: плавні градієнти без швів по сітці 16px."""
+        base = rng.integers(0, 255, size=(h // 16, w // 16, 3), dtype=np.uint8)
+        big = np.repeat(np.repeat(base, 16, axis=0), 16, axis=1)
+        # Розмиваємо, щоб межі блоків ЗНИКЛИ — так виглядає справжня сцена.
+        import cv2
+        return cv2.GaussianBlur(big, (31, 31), 0)
+
+    def broken(h=240, w=320):
+        """Побитий H.264 так, як це виглядає НАСПРАВДІ: частина блоків 16x16
+        взята не з того місця (зіпсовані вектори руху). Текстура ВСЕРЕДИНІ
+        блоку при цьому лишається — рветься саме СІТКА. Однотонні блоки були б
+        нечесним тестом: у них перепад усередині нульовий, і будь-який детектор
+        спіймав би їх тривіально."""
+        img = clean(h, w)
+        for y in range(0, h - 16, 16):
+            for x in range(0, w - 16, 16):
+                if rng.random() < 0.45:                     # ~45% блоків зсунуто
+                    sy = int(rng.integers(0, h - 16)) // 16 * 16
+                    sx = int(rng.integers(0, w - 16)) // 16 * 16
+                    img[y:y + 16, x:x + 16] = img[sy:sy + 16, sx:sx + 16]
+        return img
+
+    q = FrameQuality()
+    for _ in range(40):                       # прогрів на чистих кадрах
+        q.is_corrupt(clean())
+    check("чистий кадр не позначається побитим", not q.is_corrupt(clean()))
+    check("побитий кадр виявлено", q.is_corrupt(broken()))
+
+    # Пастка адаптивного порогу: довга серія сміття НЕ має ставати нормою.
+    q2 = FrameQuality()
+    for _ in range(40):
+        q2.is_corrupt(clean())
+    with_streak = [q2.is_corrupt(broken()) for _ in range(60)]
+    check("довга серія сміття не 'стає нормою'", all(with_streak))
+    check("після серії чистий кадр знову чистий", not q2.is_corrupt(clean()))
+
+    # Порожній/некоректний вхід не має валити конвеєр.
+    check("None не ламає детектор", FrameQuality().is_corrupt(None) is False)
+    check("рівна пляма не вважається побитою",
+          FrameQuality().is_corrupt(np.zeros((120, 160, 3), np.uint8)) is False)
+
+    # --- Головне: побитий кадр НЕ прискорює втрату цілі ---
+    from avis.control.flight import FlightSupervisor, AUTO, GROUNDED
+    from avis.control.drone import NullDrone
+    DT = 1 / 30
+
+    s = FlightSupervisor(NullDrone(), settle_after_takeoff=0.0)
+    with quiet():
+        s.takeoff(); s.arm()
+        s.update(Command(10, 0, 0), True, DT)          # ціль була захоплена
+        for _ in range(int(20 / DT)):                  # 20 с суцільного сміття
+            s.update(None, False, DT, blind=True)
+    check("20с побитих кадрів → дрон НЕ сідає", s.state == AUTO)
+
+    # А справжня втрата (кадри чисті, цілі немає) має саджати, як і раніше.
+    s2 = FlightSupervisor(NullDrone(), settle_after_takeoff=0.0)
+    with quiet():
+        s2.takeoff(); s2.arm()
+        s2.update(Command(10, 0, 0), True, DT)
+        for _ in range(int(9 / DT)):
+            s2.update(None, False, DT, blind=False)
+    check("справжня втрата 9с → саджає (не зламали безпеку)", s2.state == GROUNDED)
+
+    # Сміття НЕ дає летіти наосліп: команд у мотори бути не повинно.
+    s3 = FlightSupervisor(NullDrone(), settle_after_takeoff=0.0)
+    with quiet():
+        s3.takeoff(); s3.arm()
+        s3.update(Command(50, 0, 50), True, DT)
+        for _ in range(int(3 / DT)):
+            out = s3.update(None, False, DT, blind=True)
+    check("на сміттi дрон стоїть, а не летить наосліп",
+          out is not None and out.forward == 0 and out.yaw == 0)
+
+    # blind=False за замовчуванням — старі виклики поводяться як раніше.
+    s4 = FlightSupervisor(NullDrone(), settle_after_takeoff=0.0)
+    with quiet():
+        s4.takeoff(); s4.arm()
+        s4.update(Command(10, 0, 0), True, DT)
+        for _ in range(int(9 / DT)):
+            s4.update(None, False, DT)
+    check("сумісність: виклик без blind працює по-старому", s4.state == GROUNDED)
+
+
 def main():
     print("=" * 60)
     print("РЕГРЕСІЙНИЙ ТЕСТ-НАБІР AVIS")
@@ -582,7 +653,7 @@ def main():
     for t in (test_models, test_error_calculator, test_controller, test_kalman,
               test_selector, test_supervisor, test_drone, test_key_handling,
               test_bugfixes, test_nonblocking_takeoff,
-              test_arm_and_backward, test_key_debounce,
+              test_arm_and_backward, test_key_debounce, test_frame_quality,
               test_integration_live, test_integration_replay):
         try:
             t()

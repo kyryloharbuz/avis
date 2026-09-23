@@ -8,6 +8,7 @@ from datetime import datetime
 # Імпортуємо коротко — через фасади підпакетів (їхні __init__.py).
 from avis.app import App
 from avis.control import ErrorCalculator, FollowController
+from avis.distance import DistanceEstimator
 from avis.perception import Detector, KalmanFilter, TargetSelector, WebcamSource
 from avis.view import CvRenderer, HeadlessRenderer
 
@@ -84,7 +85,9 @@ def build_app(use_tello=False, fly=False, forward=False,
         detector=detector,
         selector=TargetSelector(),
         tracker=KalmanFilter(),
-        error_calculator=ErrorCalculator(),
+        # Оцінювач дистанції: якщо є calibrate.py-калібрування, керування
+        # дистанцією піде в МЕТРАХ (лінійно), інакше — по площі рамки.
+        error_calculator=ErrorCalculator(estimator=DistanceEstimator()),
         controller=FollowController(),
         # headless — без вікна: реплей женеться максимально швидко.
         renderer=HeadlessRenderer() if headless else CvRenderer(),

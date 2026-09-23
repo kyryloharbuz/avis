@@ -67,12 +67,13 @@ def main():
                 cv2.putText(frame, f"висота: {h_px}px", (10, 30),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
                 if collecting:
-                    samples.append(h_px)
+                    samples.append((h_px, x2 - x1))
                     cv2.putText(frame, f"замір {len(samples)}/15", (10, 65),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
                     if len(samples) >= 15:
-                        avg = sum(samples) / len(samples)
-                        k = estimator.calibrate(distance_m, avg)
+                        avg = sum(s[0] for s in samples) / len(samples)
+                        avg_w = sum(s[1] for s in samples) / len(samples)
+                        k = estimator.calibrate(distance_m, avg, avg_w)
                         print(f"\nГОТОВО: середня висота {avg:.0f}px на {distance_m:.2f} м")
                         print(f"  K = {k:.0f}  (збережено у distance_calibration.json)")
                         print("\nПеревірка — очікувані висоти рамки:")
