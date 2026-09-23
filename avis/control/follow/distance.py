@@ -102,8 +102,3 @@ class DistanceAxis(Axis):
         if error.frame_fill >= self._fill_stop or error.box_clipped:
             return min(out, 0.0)
         return out
-
-    def _retreat_command(self):
-        """Скільки давати на примусовий відступ. Помірно: різкий ривок назад
-        небезпечніший за повільний, бо позаду дрон нічого не бачить."""
-        return self._pid.kp * self._deadzone

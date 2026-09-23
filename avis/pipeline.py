@@ -33,7 +33,6 @@ class FrameResult:
     command: Command = None       # чого хоче регулятор (ще не фільтровано safety)
     target_id: int = None
     off_frame: bool = False       # прогноз вийшов за межі кадру
-    box_height: float = 0.0       # висота рамки цілі, px (для дистанції в метрах)
     detect_seconds: float = 0.0
     # Кадр побитий втратою пакетів — на ньому сміття, а не сцена. Це НЕ те саме,
     # що "цілі немає": детекція на таких кадрах падає з 85% до 6%, тож
@@ -124,7 +123,6 @@ class TrackingPipeline:
         if target is not None:
             result.status = VIS
             result.center = self._on_visible(target)
-            result.box_height = target.xyxy[3] - target.xyxy[1]
         elif lost:
             result.status = PRED
             result.center = predicted

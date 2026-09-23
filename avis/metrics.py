@@ -15,7 +15,7 @@
 # ЧЕСНІ ВІДМІННОСТІ від оригіналу (щоб не видавати бажане за дійсне):
 #   • вони обнуляють решту кадрів після ЗІТКНЕННЯ — ми зіткнення не детектуємо,
 #     тож наша оцінка ОПТИМІСТИЧНІША за їхню;
-#   • дистанцію вони міряють реальну, ми — через площу рамки (проксі);
+#   • дистанцію вони міряють реальну, ми — за розміром рамки (проксі);
 #   • їхній прогін — повний сценарій в офісі, наш — довільний запис.
 # Тому число порівнюване лише ОРІЄНТОВНО, і про це треба писати прямо.
 
@@ -50,14 +50,11 @@ def in_distance_band(distance_m, target_m, tolerance_m):
 class FollowScore:
     """Накопичує Follow-метрику по кадрах прогону."""
 
-    def __init__(self, target_m=1.6, tolerance_m=0.6, estimator=None):
+    def __init__(self, target_m=1.6, tolerance_m=0.6):
         # Уставку передає App із конфігу контролера — щоб метрика міряла
         # рівно те, чим керує система.
         self._target_m = target_m
         self._tolerance_m = tolerance_m
-        # Необов'язковий оцінювач дистанції: якщо камеру відкалібровано,
-        # у звіті з'явиться реальна відстань у МЕТРАХ, а не абстрактна площа.
-        self._estimator = estimator
         self._distances = []
         self.frames = 0          # усі кадри прогону
         self.centered = 0        # ціль у центральній третині
@@ -65,18 +62,24 @@ class FollowScore:
         self.good = 0            # і те, і те одночасно (це і є Follow-скор)
         self.no_target = 0       # кадри, де цілі не було взагалі
 
-    def add(self, center, area, frame_w, frame_h, box_height=None):
+    def add(self, center, distance_m, frame_w, frame_h):
         """center=None означає, що ціль у цьому кадрі не вели (нуль балів).
-        box_height — висота рамки в пікселях, з неї отримуємо дистанцію."""
+
+        distance_m — ГОТОВА відстань, та сама, якою керує регулятор
+        (ControlError.distance_m). Метрика її НЕ рахує сама — і це принципово.
+        Раніше вона брала висоту рамки й ділила на калібрувальну константу, а
+        керування вже давно міряло подвійно: висотою, доки рамка ціла, і
+        шириною плечей, коли зріст не вміщається. Наслідок був важкий: висота
+        впирається в ~1.33 м і ближче не бачить нічого, тоді як уставка — 0.75 м,
+        а рамка обрізана у 83% кадрів. Заміряно на реальному польоті — метрика
+        показувала 20.7% "на потрібній дистанції" замість справжніх 37.1%,
+        тобто тюнінг ішов по лінійці, сліпій у робочому діапазоні."""
         self.frames += 1
         if center is None:
             self.no_target += 1
             return
-        distance_m = None
-        if self._estimator is not None and box_height:
-            distance_m = self._estimator.meters(box_height)
-            if distance_m is not None:
-                self._distances.append(distance_m)
+        if distance_m is not None:
+            self._distances.append(distance_m)
         c = in_center_third(center[0], center[1], frame_w, frame_h)
         d = in_distance_band(distance_m, self._target_m, self._tolerance_m)
         self.centered += c

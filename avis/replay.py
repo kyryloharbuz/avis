@@ -58,10 +58,17 @@ class FlightRecorder:
             fourcc = cv2.VideoWriter_fourcc(*"mp4v")
             self._writer = cv2.VideoWriter(self._video_path, fourcc, self._fps, (w, h))
         self._writer.write(frame)
+        h, w = frame.shape[:2]
         record = {
             "frame": self._frame_idx,
             "dt": round(dt, 5),
             "target_id": target_id,
+            # РОЗМІР КАДРУ. Потрібен офлайн-аналізу (score.py), який читає лише
+            # .jsonl і відео не відкриває. Без нього доводилось припускати
+            # 960x720, тоді як Tello віддає 648x478, — і перевірка "ціль у
+            # центральній третині" рахувалась по неіснуючому кадру.
+            "frame_w": w,
+            "frame_h": h,
             "detections": [
                 {
                     "id": d.id,

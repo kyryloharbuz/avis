@@ -551,6 +551,50 @@ def test_integration_replay():
     check("тимчасові файли реплею прибрано", True)
 
 
+def test_metrics():
+    """Метрика має міряти ТЕ САМЕ, чим керує система.
+
+    Історія бага: метрика рахувала дистанцію сама, з висоти рамки, тоді як
+    керування вже міряло подвійно (висота + ширина плечей). Висота впирається
+    в ~1.33 м, а уставка — 0.75 м, і рамка обрізана у 83% кадрів. Заміряно на
+    реальному польоті: 20.7% "на потрібній дистанції" замість справжніх 37.1%."""
+    print("\n[ Метрика якості (Follow-скор) ]")
+    from avis.metrics import FollowScore, in_center_third, in_distance_band
+
+    W, H = 648, 478
+    check("центр кадру — в центральній третині", in_center_third(W / 2, H / 2, W, H))
+    check("край кадру — НЕ в центральній третині", not in_center_third(10, H / 2, W, H))
+    # Межа третини по ширині — це |cx - W/2| < W/6.
+    check("трохи за межею третини — не зараховано",
+          not in_center_third(W / 2 + W / 6 + 1, H / 2, W, H))
+
+    check("дистанція в смузі", in_distance_band(0.8, 0.75, 0.2))
+    check("дистанція поза смугою", not in_distance_band(1.5, 0.75, 0.2))
+    check("невідома дистанція не зараховується", not in_distance_band(None, 0.75, 0.2))
+
+    fs = FollowScore(target_m=0.75, tolerance_m=0.2)
+    fs.add((W / 2, H / 2), 0.75, W, H)          # у центрі й на дистанції
+    fs.add((W / 2, H / 2), 2.00, W, H)          # у центрі, але далеко
+    fs.add((10, H / 2), 0.75, W, H)             # на дистанції, але скраю
+    fs.add(None, None, W, H)                    # цілі не вели
+    check("скор рахує лише повні влучання", approx(fs.score, 0.25))
+    check("центрування рахується окремо", fs.centered == 2)
+    check("дистанція рахується окремо", fs.in_range == 2)
+    check("кадри без цілі рахуються", fs.no_target == 1)
+
+    # ГОЛОВНЕ: метрика бере ГОТОВУ дистанцію і нічого не перераховує.
+    close = FollowScore(target_m=0.75, tolerance_m=0.2)
+    close.add((W / 2, H / 2), 0.70, W, H)       # впритул — висотою це невимірно
+    check("близька дистанція зараховується (не сліпа зона)", close.score == 1.0)
+    check("у звіті зʼявляється реальна дистанція",
+          any("дистанція до цілі" in s for s in close.report()))
+
+    empty = FollowScore()
+    check("порожній прогін не ділить на нуль", empty.score == 0.0)
+    check("порожній прогін не друкує дистанцію",
+          not any("дистанція до цілі" in s for s in empty.report()))
+
+
 def test_frame_quality():
     """Побитий кадр = 'нічого не бачу', а НЕ 'цілі немає'.
 
@@ -653,7 +697,8 @@ def main():
     for t in (test_models, test_error_calculator, test_controller, test_kalman,
               test_selector, test_supervisor, test_drone, test_key_handling,
               test_bugfixes, test_nonblocking_takeoff,
-              test_arm_and_backward, test_key_debounce, test_frame_quality,
+              test_arm_and_backward, test_key_debounce,
+              test_metrics, test_frame_quality,
               test_integration_live, test_integration_replay):
         try:
             t()

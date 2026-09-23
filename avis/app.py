@@ -17,7 +17,6 @@ import time
 import cv2  # потрібен лише для констант вводу вікна (клавіші, миша)
 
 from avis.control.flight import GROUNDED, FlightSupervisor
-from avis.distance import DistanceEstimator
 from avis.metrics import FollowScore
 from avis.perception import FrameSource
 from avis.pipeline import VIS, TrackingPipeline
@@ -62,13 +61,11 @@ class App:
         self._last_key_time = 0.0
 
         self._stats = RunStats()
-        self._distance = DistanceEstimator()
         # Уставку метрики беремо З КОНТРОЛЕРА — одне джерело істини, щоб
         # метрика міряла рівно те, чим керує система.
         self._follow = FollowScore(
             target_m=getattr(controller, "distance_target_m", 1.6),
-            tolerance_m=3 * getattr(controller, "distance_deadzone_m", 0.25),
-            estimator=self._distance)
+            tolerance_m=3 * getattr(controller, "distance_deadzone_m", 0.25))
 
     # ── Ввід ───────────────────────────────────────────────────────────
     def _on_mouse(self, event, x, y, flags, param):
@@ -183,8 +180,14 @@ class App:
         self._stats.add(result, sent, w, h)
         # Follow-скор рахуємо ЛИШЕ по реально видимій цілі: у PRED позиція —
         # гіпотеза Калмана, зараховувати її як успіх було б самообманом.
-        self._follow.add(result.center if result.status == VIS else None,
-                         0.0, w, h, result.box_height)
+        #
+        # Дистанцію віддаємо ГОТОВУ — ту саму, за якою працює регулятор. Раніше
+        # метрика рахувала свою, з висоти рамки, і міряла не те, чим керує
+        # система (див. коментар у FollowScore.add).
+        visible = result.status == VIS
+        self._follow.add(result.center if visible else None,
+                         result.error.distance_m if result.error else None,
+                         w, h)
 
     def _record(self, frame, dt, result, sent):
         if self._recorder is None:
