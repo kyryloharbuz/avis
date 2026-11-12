@@ -1,0 +1,12 @@
+.venv/
+.idea/
+*.iml
+__pycache__/
+*.pyc
+*.pt
+recordings/
+runs/
+.DS_Store
+
+# Tied to one specific camera and drone, so it is wrong on any other device.
+distance_calibration.json
