@@ -15,7 +15,7 @@ graph TD
         detector["detector<br/>YOLO + ByteTrack"]
         selector["target_selector<br/>VIS / PRED / LOST"]
         kalman["tracking_filter<br/>Kalman"]
-        quality["frame_quality<br/>corrupt frames"]
+        quality["frame_quality<br/>corrupt / stale frames"]
     end
 
     subgraph control["control — flight decisions"]
@@ -62,10 +62,12 @@ This is what a single console log line describes:
 
 ```mermaid
 flowchart TD
-    A["camera frame<br/><i>648×478 BGR</i>"] --> B{"frame_quality<br/>is the frame valid?"}
-    B -->|"corrupt"| B2["pause the loss timer<br/><i>'no image' ≠ 'no target'</i>"]
-    B -->|"valid"| C["detector<br/>YOLO + ByteTrack"]
+    A["camera frame<br/><i>648×478 BGR</i>"] --> B{"frame_quality<br/>does this frame carry<br/>new information?"}
+    B -->|"stale — repeated frame"| S["skip detection entirely<br/><i>Kalman still predicts on the real dt;<br/>the supervisor holds the last command ≤ 0.3 s</i>"]
+    B -->|"corrupt — packet loss"| B2["loss timer paused<br/><i>'no image' ≠ 'no target'</i>"]
+    B -->|"clean"| C["detector<br/>YOLO + ByteTrack"]
     B2 --> C
+    S --> N
     C --> D["list of Detection objects<br/><i>xyxy, id, cls</i>"]
     D --> E{"target_selector<br/>where is our target?"}
     E -->|"visible"| F["VIS"]
@@ -130,9 +132,12 @@ same in both frames, and its decision does not depend on resolution.
 | `models.py` | the system's shared vocabulary | behaviour of the system |
 | `pipeline.py` | computation: frame → command | I/O, windows, keyboard input |
 | `app.py` | loop, I/O, orchestration | tracking internals |
+| `frame_quality.py` | telling "no information" apart from "no target" | reacting to either |
 | `target_selector.py` | VIS / PRED / LOST | drone motion |
+| `distance.py` | box height ↔ metres; the measurement limit | control decisions |
 | `follow/` | desired motion | what is safe |
 | `flight.py` | what is safe | where to fly |
+| `replay.py` | the recording format and the replay source | interpreting the results |
 | `main.py` | composing concrete implementations | application logic |
 
 ## Where abstractions exist — and where they do not
@@ -155,3 +160,11 @@ You can change one coefficient and fairly compare the command profile without a
 new flight. The limitation is fundamental: the video is fixed. New commands do
 not change the next frame, so replay shows changed controller decisions, not a
 new drone trajectory.
+
+One live failure mode does not survive recording at all: stale frames.
+`cv2.VideoWriter` re-encodes the video, so byte-identical input frames stop
+being byte-identical in the `.mp4` (measured: 0% of consecutive frames stay
+identical, 87% end up near-identical), and the exact-equality staleness probe
+never fires on replay. The costliest live failure is precisely the one the
+harness cannot reproduce — worth remembering whenever a replay looks cleaner
+than the flight felt.
